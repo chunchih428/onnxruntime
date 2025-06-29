@@ -705,6 +705,145 @@ TEST(OrtEpLibrary, PluginEp_GenEpContextModel) {
 
   ort_env->UnregisterExecutionProviderLibrary(registration_name.c_str());
 }
+
+namespace {
+struct QnnPluginInfo {
+  const std::filesystem::path library_path =
+#if _WIN32
+      "qnn_plugin_ep.dll";
+#else
+      "libqnn_plugin_ep.so";
+#endif
+  const std::string registration_name = "QNNExecutionProvider";
+};
+
+static const QnnPluginInfo qnn_plugin_info;
+}  // namespace
+
+TEST(OrtEpLibrary, LoadUnloadQnnPluginLibrary) {
+  const std::filesystem::path& library_path = qnn_plugin_info.library_path;
+  const std::string& registration_name = qnn_plugin_info.registration_name;
+
+  OrtEnv* c_api_env = *ort_env;
+  const OrtApi* c_api = &Ort::GetApi();
+  // this should load the library and create OrtEpDevice
+  ASSERT_ORTSTATUS_OK(Ort::GetApi().RegisterExecutionProviderLibrary(c_api_env, registration_name.c_str(),
+                                                                     library_path.c_str()));
+
+  const OrtEpDevice* const* ep_devices = nullptr;
+  size_t num_devices = 0;
+
+  ASSERT_ORTSTATUS_OK(Ort::GetApi().GetEpDevices(c_api_env, &ep_devices, &num_devices));
+  // should be one device for the QNN plugin EP
+  auto num_test_ep_devices = std::count_if(ep_devices, ep_devices + num_devices,
+                                           [&registration_name, &c_api](const OrtEpDevice* device) {
+                                             // the QNN plugin uses the registration name for the EP name
+                                             // but that is not a requirement and the two can differ.
+                                             return c_api->EpDevice_EpName(device) == registration_name;
+                                           });
+  ASSERT_EQ(num_test_ep_devices, 1) << "Expected an OrtEpDevice to have been created by the QNN plugin library.";
+
+  // and this should unload it
+  ASSERT_ORTSTATUS_OK(Ort::GetApi().UnregisterExecutionProviderLibrary(c_api_env,
+                                                                       registration_name.c_str()));
+}
+
+TEST(OrtEpLibrary, LoadUnloadQnnPluginLibraryCxxApi) {
+  const std::filesystem::path& library_path = qnn_plugin_info.library_path;
+  const std::string& registration_name = qnn_plugin_info.registration_name;
+
+  // this should load the library and create OrtEpDevice
+  ort_env->RegisterExecutionProviderLibrary(registration_name.c_str(), library_path.c_str());
+
+  std::vector<Ort::ConstEpDevice> ep_devices = ort_env->GetEpDevices();
+  for (const Ort::ConstEpDevice& device : ep_devices) {
+    std::cout << "EP Device: " << device.EpName() << ", Vendor: " << device.EpVendor() << std::endl;
+  }
+
+  // should be one device for the QNN plugin EP
+  auto test_ep_device = std::find_if(ep_devices.begin(), ep_devices.end(),
+                                     [&registration_name](Ort::ConstEpDevice& device) {
+                                       // the QNN plugin uses the registration name for the EP name
+                                       // but that is not a requirement and the two can differ.
+                                       return device.EpName() == registration_name;
+                                     });
+  ASSERT_NE(test_ep_device, ep_devices.end()) << "Expected an OrtEpDevice to have been created by the QNN plugin library.";
+
+  // test all the C++ getters. expected values are from qnn_plugin_ep.cc
+  ASSERT_STREQ(test_ep_device->EpVendor(), "Qualcomm");
+
+  auto metadata = test_ep_device->EpMetadata();
+  ASSERT_STREQ(metadata.GetValue("version"), "1.0");
+  ASSERT_STREQ(metadata.GetValue("backend_type"), "cpu");
+
+  auto options = test_ep_device->EpOptions();
+  ASSERT_STREQ(options.GetValue("enable_htp_fp16_precision"), "false");
+  ASSERT_STREQ(options.GetValue("qnn_context_priority"), "normal");
+
+  // the CPU device info will vary by machine so check for the lowest common denominator values
+  Ort::ConstHardwareDevice device = test_ep_device->Device();
+  ASSERT_EQ(device.Type(), OrtHardwareDeviceType_CPU);
+  ASSERT_GE(device.VendorId(), 0);
+  ASSERT_GE(device.DeviceId(), 0);
+  ASSERT_NE(device.Vendor(), nullptr);
+  Ort::ConstKeyValuePairs device_metadata = device.Metadata();
+  std::unordered_map<std::string, std::string> metadata_entries = device_metadata.GetKeyValuePairs();
+  ASSERT_GT(metadata_entries.size(), 0);  // should have at least SPDRP_HARDWAREID on Windows
+
+  // and this should unload it without throwing
+  ort_env->UnregisterExecutionProviderLibrary(registration_name.c_str());
+}
+
+// Creates a session with the QNN plugin EP and runs a model with a single Mul node.
+// Uses AppendExecutionProvider_V2 to append the QNN plugin EP to the session.
+TEST(OrtEpLibrary, QnnPluginEp_AppendV2_MulInference) {
+  const std::filesystem::path& library_path = qnn_plugin_info.library_path;
+  const std::string& registration_name = qnn_plugin_info.registration_name;
+
+  ort_env->RegisterExecutionProviderLibrary(registration_name.c_str(), library_path.c_str());
+
+  {
+    std::vector<Ort::ConstEpDevice> ep_devices = ort_env->GetEpDevices();
+
+    // Find the OrtEpDevice associated with our QNN plugin EP.
+    Ort::ConstEpDevice plugin_ep_device;
+    for (Ort::ConstEpDevice& device : ep_devices) {
+      if (std::string(device.EpName()) == registration_name) {
+        std::cout << "Found QNN plugin EP: " << device.EpName() << std::endl;
+        plugin_ep_device = device;
+        break;
+      }
+    }
+    ASSERT_NE(plugin_ep_device, nullptr);
+
+    // Create session with QNN plugin EP
+    Ort::SessionOptions session_options;
+    std::unordered_map<std::string, std::string> ep_options;
+    session_options.AppendExecutionProvider_V2(*ort_env, std::vector<Ort::ConstEpDevice>{plugin_ep_device}, ep_options);
+
+    RunModelWithPluginEp(session_options);
+  }
+
+  ort_env->UnregisterExecutionProviderLibrary(registration_name.c_str());
+}
+
+// Creates a session with the QNN plugin EP and runs a model with a single Mul node.
+// Uses the PREFER_CPU policy to append the QNN plugin EP to the session.
+TEST(OrtEpLibrary, QnnPluginEp_PreferCpu_MulInference) {
+  const std::filesystem::path& library_path = qnn_plugin_info.library_path;
+  const std::string& registration_name = qnn_plugin_info.registration_name;
+
+  ort_env->RegisterExecutionProviderLibrary(registration_name.c_str(), library_path.c_str());
+
+  {
+    // PREFER_CPU pick our QNN plugin EP over ORT CPU EP. TODO: Actually assert this.
+    Ort::SessionOptions session_options;
+    session_options.SetEpSelectionPolicy(OrtExecutionProviderDevicePolicy_PREFER_CPU);
+    RunModelWithPluginEp(session_options);
+  }
+
+  ort_env->UnregisterExecutionProviderLibrary(registration_name.c_str());
+}
 }  // namespace test
 }  // namespace onnxruntime
 

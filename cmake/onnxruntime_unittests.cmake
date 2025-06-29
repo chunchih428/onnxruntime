@@ -1111,7 +1111,7 @@ if (NOT IOS)
 
     target_link_libraries(onnx_test_runner PRIVATE onnx_test_runner_common ${GETOPT_LIB_WIDE} ${onnx_test_libs} nlohmann_json::nlohmann_json)
     target_include_directories(onnx_test_runner PRIVATE ${ONNXRUNTIME_ROOT})
-    
+
     if (onnxruntime_ENABLE_TRAINING_TORCH_INTEROP)
       target_link_libraries(onnx_test_runner PRIVATE Python::Python)
     endif()
@@ -1232,7 +1232,7 @@ if (NOT onnxruntime_ENABLE_TRAINING_TORCH_INTEROP)
     target_include_directories(onnxruntime_perf_test PRIVATE   ${onnx_test_runner_src_dir} ${ONNXRUNTIME_ROOT}
           ${onnxruntime_graph_header} ${onnxruntime_exec_src_dir}
           ${CMAKE_CURRENT_BINARY_DIR})
-    
+
     if (WIN32)
       target_compile_options(onnxruntime_perf_test PRIVATE ${disabled_warnings})
       if (NOT DEFINED SYS_PATH_LIB)
@@ -1338,7 +1338,7 @@ endif()
     if (onnxruntime_USE_CUDA)
       list(APPEND onnxruntime_shared_lib_test_LIBS)
     endif()
-    
+
     if (onnxruntime_USE_TENSORRT)
       list(APPEND onnxruntime_shared_lib_test_LIBS ${TENSORRT_LIBRARY_INFER})
     endif()
@@ -1372,7 +1372,7 @@ endif()
     if (onnxruntime_USE_NV)
       target_include_directories(onnxruntime_shared_lib_test PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     endif()
-    
+
 
     if (CMAKE_SYSTEM_NAME STREQUAL "Android")
       target_sources(onnxruntime_shared_lib_test PRIVATE
@@ -1429,7 +1429,7 @@ endif()
       DEPENDS ${all_dependencies}
     )
 
-    
+
 
     target_compile_definitions(onnxruntime_test_debug_node_inputs_outputs
       PRIVATE DEBUG_NODE_INPUTS_OUTPUTS)
@@ -1793,9 +1793,14 @@ endif()
 if (WIN32 AND onnxruntime_BUILD_SHARED_LIB AND
     NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten" AND
     NOT onnxruntime_MINIMAL_BUILD)
-  file(GLOB onnxruntime_autoep_test_library_src "${TEST_SRC_DIR}/autoep/library/*.h"
-                                                "${TEST_SRC_DIR}/autoep/library/*.cc")
-  onnxruntime_add_shared_library_module(example_plugin_ep ${onnxruntime_autoep_test_library_src})
+  file(GLOB onnxruntime_autoep_test_library_common_src "${TEST_SRC_DIR}/autoep/library/*.h"
+                                                      "${TEST_SRC_DIR}/autoep/library/ep.cc"
+                                                      "${TEST_SRC_DIR}/autoep/library/ep_data_transfer.cc"
+                                                      "${TEST_SRC_DIR}/autoep/library/ep_factory.cc"
+                                                      "${TEST_SRC_DIR}/autoep/library/example_plugin_ep_utils.cc")
+  set(onnxruntime_example_plugin_ep_src ${onnxruntime_autoep_test_library_common_src}
+                                        "${TEST_SRC_DIR}/autoep/library/example_plugin_ep.cc")
+  onnxruntime_add_shared_library_module(example_plugin_ep ${onnxruntime_example_plugin_ep_src})
   target_include_directories(example_plugin_ep PRIVATE ${REPO_ROOT}/include/onnxruntime/core/session)
   target_link_libraries(example_plugin_ep PRIVATE onnxruntime)
 
@@ -1813,6 +1818,32 @@ if (WIN32 AND onnxruntime_BUILD_SHARED_LIB AND
   endif()
 
   set_property(TARGET example_plugin_ep APPEND_STRING PROPERTY LINK_FLAGS
+               ${ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG})
+
+  set(onnxruntime_qnn_plugin_ep_src ${onnxruntime_autoep_test_library_common_src}
+                                   "${TEST_SRC_DIR}/autoep/library/qnn_plugin_ep.cc"
+                                   "${TEST_SRC_DIR}/autoep/library/ep_factory_qnn.cc"
+                                   "${TEST_SRC_DIR}/autoep/library/ep_qnn.cc"
+                                   "${TEST_SRC_DIR}/autoep/library/qnn_op_builder.cc"
+                                   "${TEST_SRC_DIR}/autoep/library/qnn_op_builder_factory.cc")
+  onnxruntime_add_shared_library_module(qnn_plugin_ep ${onnxruntime_qnn_plugin_ep_src})
+  target_include_directories(qnn_plugin_ep PRIVATE ${REPO_ROOT}/include/onnxruntime/core/session)
+  target_link_libraries(qnn_plugin_ep PRIVATE onnxruntime)
+
+  if(UNIX)
+    if (APPLE)
+      set(ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG "-Xlinker -dead_strip")
+    elseif (NOT CMAKE_SYSTEM_NAME MATCHES "AIX")
+      string(CONCAT ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG
+             "-Xlinker --version-script=${TEST_SRC_DIR}/autoep/library/qnn_plugin_ep_library.lds "
+             "-Xlinker --no-undefined -Xlinker --gc-sections -z noexecstack")
+    endif()
+  else()
+    set(ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG
+        "-DEF:${TEST_SRC_DIR}/autoep/library/qnn_plugin_ep_library.def")
+  endif()
+
+  set_property(TARGET qnn_plugin_ep APPEND_STRING PROPERTY LINK_FLAGS
                ${ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG})
 
   # test library

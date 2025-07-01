@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "ep_factory_qnn.h"
+#include "qnn_ep_factory.h"
 
 // To make symbols visible on macOS/iOS and Windows
 #ifdef __APPLE__

@@ -147,7 +147,7 @@
             RUNTIME  DESTINATION ${CMAKE_INSTALL_BINDIR})
 
     set(onnxruntime_providers_qnn_target onnxruntime_providers_qnn)
-    
+
     if (MSVC OR ${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
       add_custom_command(
         TARGET ${onnxruntime_providers_qnn_target} POST_BUILD
@@ -168,4 +168,38 @@ if (NOT onnxruntime_BUILD_SHARED_LIB)
           LIBRARY   DESTINATION ${CMAKE_INSTALL_LIBDIR}
           RUNTIME   DESTINATION ${CMAKE_INSTALL_BINDIR}
           FRAMEWORK DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+if (WIN32 AND onnxruntime_BUILD_SHARED_LIB AND
+    NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten" AND
+    NOT onnxruntime_MINIMAL_BUILD)
+  file(GLOB onnxruntime_autoep_test_library_common_src "${TEST_SRC_DIR}/autoep/library/*.h"
+                                                      "${TEST_SRC_DIR}/autoep/library/ep.cc"
+                                                      "${TEST_SRC_DIR}/autoep/library/ep_data_transfer.cc"
+                                                      "${TEST_SRC_DIR}/autoep/library/ep_factory.cc"
+                                                      "${TEST_SRC_DIR}/autoep/library/example_plugin_ep_utils.cc")
+
+  set(onnxruntime_qnn_plugin_ep_src ${onnxruntime_autoep_test_library_common_src}
+                                   "${ONNXRUNTIME_ROOT}/core/providers/qnn-abi/qnn_plugin_ep.cc"
+                                   "${ONNXRUNTIME_ROOT}/core/providers/qnn-abi/qnn_ep_factory.h"
+                                   "${ONNXRUNTIME_ROOT}/core/providers/qnn-abi/qnn_ep.cc")
+  onnxruntime_add_shared_library_module(qnn_plugin_ep ${onnxruntime_qnn_plugin_ep_src})
+  target_include_directories(qnn_plugin_ep PRIVATE ${REPO_ROOT}/include/onnxruntime/core/session)
+  target_link_libraries(qnn_plugin_ep PRIVATE onnxruntime)
+
+  if(UNIX)
+    if (APPLE)
+      set(ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG "-Xlinker -dead_strip")
+    elseif (NOT CMAKE_SYSTEM_NAME MATCHES "AIX")
+      string(CONCAT ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG
+             "-Xlinker --version-script=${ONNXRUNTIME_ROOT}/core/providers/qnn-abi/qnn_plugin_ep_library.lds "
+             "-Xlinker --no-undefined -Xlinker --gc-sections -z noexecstack")
+    endif()
+  else()
+    set(ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG
+        "-DEF:${ONNXRUNTIME_ROOT}/core/providers/qnn-abi/qnn_plugin_ep_library.def")
+  endif()
+
+  set_property(TARGET qnn_plugin_ep APPEND_STRING PROPERTY LINK_FLAGS
+               ${ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG})
 endif()

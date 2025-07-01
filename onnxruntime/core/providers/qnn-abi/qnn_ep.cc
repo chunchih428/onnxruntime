@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "ep_qnn.h"
+#include "qnn_ep.h"
 
 #include <cassert>
 #include <cstring>
@@ -12,8 +12,10 @@
 #include <vector>
 #include <iostream>
 
-#include "ep_factory_qnn.h"
-#include "qnn_op_builder_factory.h"
+#include "qnn_ep_factory.h"
+#include "builder/op_builder_factory.h"
+#include "core/providers/qnn-abi/qnn_allocator.h"
+#include "core/providers/qnn-abi/shared_context.h"
 
 /// <summary>
 /// QNN implementation of ONNX Mul. Does not handle many things like broadcasting.
@@ -156,7 +158,41 @@ QnnEp::QnnEp(QnnEpFactory& factory, const std::string& name, const Config& confi
       factory_{factory},
       name_{name},
       config_{config},
-      logger_{logger} {
+      logger_{logger},
+      context_cache_enabled_(config.enable_ep_context),
+      share_ep_contexts_(config.share_ep_contexts) {
+
+  // Initialize RpcMem library if HTP shared memory allocator is enabled
+  if (config_.enable_htp_shared_memory_allocator) {
+    try {
+      rpcmem_library_ = std::make_shared<qnn::RpcMemLibrary>();
+      auto status = ort_api.Logger_LogMessage(&logger_,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+                                              "QnnEp: HTP shared memory allocator enabled",
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+      (void)status;  // ignore status for now
+    } catch (const std::exception& e) {
+      auto status = ort_api.Logger_LogMessage(&logger_,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                              ("QnnEp: Failed to initialize RpcMem library: " + std::string(e.what())).c_str(),
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+      (void)status;  // ignore status for now
+      rpcmem_library_.reset();  // Ensure it's null on failure
+    }
+  }
+
+  // Initialize SharedContext usage
+  if (share_ep_contexts_) {
+    auto& shared_context = onnxruntime::SharedContext::GetInstance();
+    // Check if there are already shared QNN models available
+    if (shared_context.HasSharedQnnModels()) {
+      auto status = ort_api.Logger_LogMessage(&logger_,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+                                              "QnnEp: Found existing shared QNN models",
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+      (void)status;  // ignore status for now
+    }
+  }
   ort_version_supported = ORT_API_VERSION;  // set to the ORT version we were compiled with.
 
   // Initialize the execution provider's function table
@@ -235,44 +271,11 @@ OrtStatus* ORT_API_CALL QnnEp::GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph
                                                      OrtEpGraphSupportInfo* graph_support_info) {
   QnnEp* ep = static_cast<QnnEp*>(this_ptr);
 
-  OrtArrayOfConstObjects* nodes_array = nullptr;
-  DeferOrtRelease<OrtArrayOfConstObjects> release_nodes_array(&nodes_array, ep->ort_api.ReleaseArrayOfConstObjects);
+  // Get supported nodes using QNN EP pattern
+  std::vector<const OrtNode*> supported_nodes = ep->GetSupportedNodes(graph);
 
-  size_t num_nodes = 0;
-
-  RETURN_IF_ERROR(ep->ort_api.Graph_GetNodes(graph, &nodes_array));
-  RETURN_IF_ERROR(ep->ort_api.ArrayOfConstObjects_GetSize(nodes_array, &num_nodes));
-
-  if (num_nodes == 0) {
+  if (supported_nodes.empty()) {
     return nullptr;  // No nodes to process
-  }
-
-  const void* const* nodes_data = nullptr;
-  RETURN_IF_ERROR(ep->ort_api.ArrayOfConstObjects_GetData(nodes_array, &nodes_data));
-  auto nodes_span = gsl::span<const OrtNode* const>(reinterpret_cast<const OrtNode* const*>(nodes_data), num_nodes);
-
-  std::vector<const OrtNode*> supported_nodes;
-
-  // Use op builder system to determine supported nodes (following QNN provider pattern)
-  for (const OrtNode* node : nodes_span) {
-    const char* op_type = nullptr;
-    RETURN_IF_ERROR(ep->ort_api.Node_GetOperatorType(node, &op_type));
-
-    // Get op builder for this op type
-    const qnn_ep::IOpBuilder* op_builder = qnn_ep::GetOpBuilder(op_type);
-    if (op_builder != nullptr) {
-      // Check if this specific node is supported
-      ApiPtrs apis = {ep->ort_api, ep->ep_api, ep->model_editor_api};
-      OrtStatus* status = op_builder->IsOpSupported(apis, node);
-      if (status == nullptr) {
-        // Node is supported, add to list
-        supported_nodes.push_back(node);
-      } else {
-        // Node not supported, release status and continue
-        ep->ort_api.ReleaseStatus(status);
-      }
-    }
-    // If no op builder found, node is not supported (skip silently)
   }
 
   // Create (optional) fusion options for the supported nodes to fuse.
@@ -486,3 +489,91 @@ void QnnNodeComputeInfo::ReleaseStateImpl(OrtNodeComputeInfo* this_ptr, void* co
   (void)kernel;
   // Do nothing for this QNN example.
 }
+
+// GetSupportedNodes implementation following QNN EP pattern
+std::vector<const OrtNode*> QnnEp::GetSupportedNodes(const OrtGraph* graph) const {
+  std::vector<const OrtNode*> supported_nodes;
+
+  OrtArrayOfConstObjects* nodes_array = nullptr;
+  DeferOrtRelease<OrtArrayOfConstObjects> release_nodes_array(&nodes_array, ort_api.ReleaseArrayOfConstObjects);
+
+  size_t num_nodes = 0;
+
+  if (ort_api.Graph_GetNodes(graph, &nodes_array) != nullptr) {
+    return supported_nodes;  // Return empty on error
+  }
+
+  if (ort_api.ArrayOfConstObjects_GetSize(nodes_array, &num_nodes) != nullptr) {
+    return supported_nodes;  // Return empty on error
+  }
+
+  if (num_nodes == 0) {
+    return supported_nodes;  // No nodes to process
+  }
+
+  const void* const* nodes_data = nullptr;
+  if (ort_api.ArrayOfConstObjects_GetData(nodes_array, &nodes_data) != nullptr) {
+    return supported_nodes;  // Return empty on error
+  }
+
+  auto nodes_span = gsl::span<const OrtNode* const>(reinterpret_cast<const OrtNode* const*>(nodes_data), num_nodes);
+
+  // Use op builder system to determine supported nodes (following QNN provider pattern)
+  for (const OrtNode* node : nodes_span) {
+    const char* op_type = nullptr;
+    if (ort_api.Node_GetOperatorType(node, &op_type) != nullptr) {
+      continue;  // Skip on error
+    }
+
+    // Get op builder for this op type
+    const qnn_ep::IOpBuilder* op_builder = qnn_ep::GetOpBuilder(op_type);
+    if (op_builder != nullptr) {
+      // Check if this specific node is supported
+      ApiPtrs apis = {ort_api, ep_api, model_editor_api};
+      OrtStatus* status = op_builder->IsOpSupported(apis, node);
+      if (status == nullptr) {
+        // Node is supported, add to list
+        supported_nodes.push_back(node);
+      } else {
+        // Node not supported, release status and continue
+        ort_api.ReleaseStatus(status);
+      }
+    }
+    // If no op builder found, node is not supported (skip silently)
+  }
+
+  return supported_nodes;
+}
+
+// CreatePreferredAllocators implementation following QNN EP pattern
+// Note: Commented out until AllocatorPtr definition is available
+/*
+std::vector<AllocatorPtr> QnnEp::CreatePreferredAllocators() {
+  std::vector<AllocatorPtr> allocators{};
+
+  if (IsHtpSharedMemoryAllocatorAvailable()) {
+    try {
+      // Create HTP shared memory allocator following QNN provider pattern
+      auto htp_allocator = std::make_unique<qnn::HtpSharedMemoryAllocator>(rpcmem_library_, &logger_);
+      
+      // Convert to AllocatorPtr (this conversion needs adjustment based on actual AllocatorPtr definition)
+      AllocatorPtr allocator_ptr(std::move(htp_allocator));
+      allocators.emplace_back(std::move(allocator_ptr));
+      
+      auto status = ort_api.Logger_LogMessage(&logger_,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+                                              "QnnEp: Created HTP shared memory allocator",
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+      (void)status;  // ignore status for now
+    } catch (const std::exception& e) {
+      auto status = ort_api.Logger_LogMessage(&logger_,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                              ("QnnEp: Failed to create HTP shared memory allocator: " + std::string(e.what())).c_str(),
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+      (void)status;  // ignore status for now
+    }
+  }
+  
+  return allocators;
+}
+*/

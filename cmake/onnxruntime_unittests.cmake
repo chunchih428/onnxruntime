@@ -722,6 +722,7 @@ endif()
 if(onnxruntime_USE_QNN AND NOT onnxruntime_MINIMAL_BUILD AND NOT onnxruntime_REDUCED_OPS_BUILD)
   list(APPEND onnxruntime_test_framework_src_patterns ${TEST_SRC_DIR}/providers/qnn/*)
   list(APPEND onnxruntime_test_framework_src_patterns ${TEST_SRC_DIR}/providers/qnn/qnn_node_group/*)
+  list(APPEND onnxruntime_test_framework_src_patterns ${TEST_SRC_DIR}/providers/qnn-abi/*)
   list(APPEND onnxruntime_test_framework_libs onnxruntime_providers_qnn)
   list(APPEND onnxruntime_test_providers_dependencies onnxruntime_providers_qnn)
   if(NOT onnxruntime_BUILD_QNN_EP_STATIC_LIB)
@@ -1818,32 +1819,6 @@ if (WIN32 AND onnxruntime_BUILD_SHARED_LIB AND
   endif()
 
   set_property(TARGET example_plugin_ep APPEND_STRING PROPERTY LINK_FLAGS
-               ${ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG})
-
-  set(onnxruntime_qnn_plugin_ep_src ${onnxruntime_autoep_test_library_common_src}
-                                   "${TEST_SRC_DIR}/autoep/library/qnn_plugin_ep.cc"
-                                   "${TEST_SRC_DIR}/autoep/library/ep_factory_qnn.cc"
-                                   "${TEST_SRC_DIR}/autoep/library/ep_qnn.cc"
-                                   "${TEST_SRC_DIR}/autoep/library/qnn_op_builder.cc"
-                                   "${TEST_SRC_DIR}/autoep/library/qnn_op_builder_factory.cc")
-  onnxruntime_add_shared_library_module(qnn_plugin_ep ${onnxruntime_qnn_plugin_ep_src})
-  target_include_directories(qnn_plugin_ep PRIVATE ${REPO_ROOT}/include/onnxruntime/core/session)
-  target_link_libraries(qnn_plugin_ep PRIVATE onnxruntime)
-
-  if(UNIX)
-    if (APPLE)
-      set(ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG "-Xlinker -dead_strip")
-    elseif (NOT CMAKE_SYSTEM_NAME MATCHES "AIX")
-      string(CONCAT ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG
-             "-Xlinker --version-script=${TEST_SRC_DIR}/autoep/library/qnn_plugin_ep_library.lds "
-             "-Xlinker --no-undefined -Xlinker --gc-sections -z noexecstack")
-    endif()
-  else()
-    set(ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG
-        "-DEF:${TEST_SRC_DIR}/autoep/library/qnn_plugin_ep_library.def")
-  endif()
-
-  set_property(TARGET qnn_plugin_ep APPEND_STRING PROPERTY LINK_FLAGS
                ${ONNXRUNTIME_AUTOEP_LIB_LINK_FLAG})
 
   # test library

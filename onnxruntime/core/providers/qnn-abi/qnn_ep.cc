@@ -1,0 +1,579 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include "qnn_ep.h"
+
+#include <cassert>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <iostream>
+
+#include "qnn_ep_factory.h"
+#include "builder/op_builder_factory.h"
+#include "core/providers/qnn-abi/qnn_allocator.h"
+#include "core/providers/qnn-abi/shared_context.h"
+
+/// <summary>
+/// QNN implementation of ONNX Mul. Does not handle many things like broadcasting.
+/// </summary>
+struct QnnMulKernel {
+  QnnMulKernel(const OrtApi& ort_api, const OrtLogger& logger,
+            const std::unordered_map<std::string, FloatInitializer>& float_initializers,
+            std::string input0_name, std::string input1_name)
+      : ort_api(ort_api),
+        logger(logger),
+        float_initializers(float_initializers),
+        input0_name(input0_name),
+        input1_name(input1_name) {}
+
+  const FloatInitializer* TryGetSavedInitializer(const std::string& name) const {
+    auto iter = float_initializers.find(name);
+    return iter != float_initializers.end() ? &iter->second : nullptr;
+  }
+
+  OrtStatus* GetInputDataAndShape(OrtKernelContext* kernel_context, size_t index,
+                                  /*out*/ gsl::span<const float>& data,
+                                  /*out*/ std::vector<int64_t>& shape) const {
+    const OrtValue* input = nullptr;
+    RETURN_IF_ERROR(ort_api.KernelContext_GetInput(kernel_context, index, &input));
+
+    OrtTensorTypeAndShapeInfo* type_shape = nullptr;
+    DeferOrtRelease<OrtTensorTypeAndShapeInfo> release_type(&type_shape, ort_api.ReleaseTensorTypeAndShapeInfo);
+
+    RETURN_IF_ERROR(ort_api.GetTensorTypeAndShape(input, &type_shape));
+
+    ONNXTensorElementDataType elem_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    RETURN_IF_ERROR(ort_api.GetTensorElementType(type_shape, &elem_type));
+    RETURN_IF(elem_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, ort_api, "Expected float32 inputs");
+
+    size_t num_elems = 0;
+    RETURN_IF_ERROR(ort_api.GetTensorShapeElementCount(type_shape, &num_elems));
+
+    size_t num_dims = 0;
+    RETURN_IF_ERROR(ort_api.GetDimensionsCount(type_shape, &num_dims));
+
+    shape.resize(num_dims, 0);
+    RETURN_IF_ERROR(ort_api.GetDimensions(type_shape, shape.data(), shape.size()));
+
+    const void* raw_data = nullptr;
+    RETURN_IF_ERROR(ort_api.GetTensorData(input, &raw_data));
+
+    const float* float_data = static_cast<const float*>(raw_data);
+    data = gsl::span<const float>(float_data, num_elems);
+    return nullptr;
+  }
+
+  OrtStatus* Compute(OrtKernelContext* kernel_context) {
+    RETURN_IF_ERROR(ort_api.Logger_LogMessage(&logger,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+                                              "QnnMulKernel::Compute", ORT_FILE, __LINE__, __FUNCTION__));
+    gsl::span<const float> input0;
+    gsl::span<const float> input1;
+    std::vector<int64_t> shape0;
+    std::vector<int64_t> shape1;
+
+    size_t num_inputs = 0;
+    RETURN_IF_ERROR(ort_api.KernelContext_GetInputCount(kernel_context, &num_inputs));
+
+    if (num_inputs == 2) {
+      // Both inputs are non-constant. Get them from ORT's KernelContext.
+      RETURN_IF_ERROR(GetInputDataAndShape(kernel_context, 0, input0, shape0));
+      RETURN_IF_ERROR(GetInputDataAndShape(kernel_context, 1, input1, shape1));
+    } else if (num_inputs == 1) {
+      // ORT is only providing one non-constant input because this EP chose not to request constant initializer inputs.
+      // Get the constant input from the initializers saved by the EP.
+      // Refer to "NodeFusionOptions_DropConstantInitializers()".
+
+      if (const FloatInitializer* const_input0 = TryGetSavedInitializer(input0_name); const_input0 != nullptr) {
+        RETURN_IF_ERROR(GetInputDataAndShape(kernel_context, 0, input1, shape1));
+        input0 = gsl::span<const float>(const_input0->data);
+        shape0 = const_input0->shape;
+      } else if (const FloatInitializer* const_input1 = TryGetSavedInitializer(input1_name); const_input1 != nullptr) {
+        RETURN_IF_ERROR(GetInputDataAndShape(kernel_context, 0, input0, shape0));
+        input1 = gsl::span<const float>(const_input1->data);
+        shape1 = const_input1->shape;
+      }
+    } else {
+      // Both inputs are constant. Should never happen unless all ORT optimizations (specifically constant-folding)
+      // are disabled.
+      const FloatInitializer* const_input0 = TryGetSavedInitializer(input0_name);
+      const FloatInitializer* const_input1 = TryGetSavedInitializer(input1_name);
+      RETURN_IF(const_input0 == nullptr || const_input1 == nullptr, ort_api,
+                "Expected 2 initializer inputs to be saved by EP");
+
+      input0 = gsl::span<const float>(const_input0->data);
+      input1 = gsl::span<const float>(const_input1->data);
+      shape0 = const_input0->shape;
+      shape1 = const_input1->shape;
+    }
+
+    RETURN_IF(shape0 != shape1, ort_api, "Expected same dimensions for both inputs");  // No broadcasting.
+
+    size_t num_outputs = 0;
+    RETURN_IF_ERROR(ort_api.KernelContext_GetOutputCount(kernel_context, &num_outputs));
+    RETURN_IF(num_outputs != 1, ort_api, "Expected 1 output for QnnMulKernel");
+
+    OrtValue* output = nullptr;
+    float* output_data = nullptr;
+    RETURN_IF_ERROR(ort_api.KernelContext_GetOutput(kernel_context, 0, shape0.data(), shape0.size(), &output));
+    RETURN_IF_ERROR(ort_api.GetTensorMutableData(output, reinterpret_cast<void**>(&output_data)));
+
+    for (size_t i = 0; i < input0.size(); ++i) {
+      output_data[i] = input0[i] * input1[i];
+    }
+
+    return nullptr;
+  }
+
+  const OrtApi& ort_api;
+  const OrtLogger& logger;
+  const std::unordered_map<std::string, FloatInitializer>& float_initializers;
+  std::string input0_name;
+  std::string input1_name;
+};
+
+/// <summary>
+/// QNN OrtNodeComputeInfo that represents the computation function for a compiled OrtGraph.
+/// </summary>
+struct QnnNodeComputeInfo : OrtNodeComputeInfo {
+  explicit QnnNodeComputeInfo(QnnEp& ep);
+
+  static OrtStatus* ORT_API_CALL CreateStateImpl(OrtNodeComputeInfo* this_ptr,
+                                                 OrtNodeComputeContext* compute_context,
+                                                 void** compute_state);
+  static OrtStatus* ORT_API_CALL ComputeImpl(OrtNodeComputeInfo* this_ptr, void* compute_state,
+                                             OrtKernelContext* kernel_context);
+  static void ORT_API_CALL ReleaseStateImpl(OrtNodeComputeInfo* this_ptr, void* compute_state);
+
+  QnnEp& ep;
+};
+
+QnnEp::QnnEp(QnnEpFactory& factory, const std::string& name, const Config& config, const OrtLogger& logger)
+    : OrtEp{},  // explicitly call the struct ctor to ensure all optional values are default initialized
+      ApiPtrs{static_cast<const ApiPtrs&>(factory)},
+      factory_{factory},
+      name_{name},
+      config_{config},
+      logger_{logger},
+      context_cache_enabled_(config.enable_ep_context),
+      share_ep_contexts_(config.share_ep_contexts) {
+
+  // Initialize RpcMem library if HTP shared memory allocator is enabled
+  if (config_.enable_htp_shared_memory_allocator) {
+    try {
+      rpcmem_library_ = std::make_shared<qnn::RpcMemLibrary>();
+      auto status = ort_api.Logger_LogMessage(&logger_,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+                                              "QnnEp: HTP shared memory allocator enabled",
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+      (void)status;  // ignore status for now
+    } catch (const std::exception& e) {
+      auto status = ort_api.Logger_LogMessage(&logger_,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                              ("QnnEp: Failed to initialize RpcMem library: " + std::string(e.what())).c_str(),
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+      (void)status;  // ignore status for now
+      rpcmem_library_.reset();  // Ensure it's null on failure
+    }
+  }
+
+  // Initialize SharedContext usage
+  if (share_ep_contexts_) {
+    auto& shared_context = onnxruntime::SharedContext::GetInstance();
+    // Check if there are already shared QNN models available
+    if (shared_context.HasSharedQnnModels()) {
+      auto status = ort_api.Logger_LogMessage(&logger_,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+                                              "QnnEp: Found existing shared QNN models",
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+      (void)status;  // ignore status for now
+    }
+  }
+  ort_version_supported = ORT_API_VERSION;  // set to the ORT version we were compiled with.
+
+  // Initialize the execution provider's function table
+  GetName = GetNameImpl;
+  GetCapability = GetCapabilityImpl;
+  Compile = CompileImpl;
+  ReleaseNodeComputeInfos = ReleaseNodeComputeInfosImpl;
+
+  auto status = ort_api.Logger_LogMessage(&logger_,
+                                          OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+                                          ("QnnEp has been created with name " + name_).c_str(),
+                                          ORT_FILE, __LINE__, __FUNCTION__);
+  // ignore status for now
+  (void)status;
+}
+
+QnnEp::~QnnEp() = default;
+
+/*static*/
+const char* ORT_API_CALL QnnEp ::GetNameImpl(const OrtEp* this_ptr) noexcept {
+  const auto* ep = static_cast<const QnnEp*>(this_ptr);
+  return ep->name_.c_str();
+}
+
+OrtStatus* QnnEp::SaveConstantInitializers(const OrtGraph* graph) {
+  OrtArrayOfConstObjects* initializers = nullptr;
+  DeferOrtRelease<OrtArrayOfConstObjects> release_initializers(&initializers, ort_api.ReleaseArrayOfConstObjects);
+  size_t num_initializers = 0;
+
+  RETURN_IF_ERROR(ort_api.Graph_GetInitializers(graph, &initializers));
+  RETURN_IF_ERROR(ort_api.ArrayOfConstObjects_GetSize(initializers, &num_initializers));
+
+  for (size_t i = 0; i < num_initializers; ++i) {
+    const OrtValueInfo* initializer = nullptr;
+    RETURN_IF_ERROR(ort_api.ArrayOfConstObjects_GetElementAt(initializers, i,
+                                                             reinterpret_cast<const void**>(&initializer)));
+
+    bool is_constant = false;
+    RETURN_IF_ERROR(ort_api.ValueInfo_IsConstantInitializer(initializer, &is_constant));
+
+    if (is_constant) {
+      const char* name = nullptr;
+      const OrtValue* value = nullptr;
+      OrtTensorTypeAndShapeInfo* type_shape = nullptr;
+      DeferOrtRelease<OrtTensorTypeAndShapeInfo> release_type(&type_shape, ort_api.ReleaseTensorTypeAndShapeInfo);
+      size_t num_elems = 0;
+
+      RETURN_IF_ERROR(ort_api.GetValueInfoName(initializer, &name));
+      RETURN_IF_ERROR(ort_api.ValueInfo_GetInitializerValue(initializer, &value));
+      RETURN_IF_ERROR(ort_api.GetTensorTypeAndShape(value, &type_shape));
+      RETURN_IF_ERROR(ort_api.GetTensorShapeElementCount(type_shape, &num_elems));
+
+      ONNXTensorElementDataType elem_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+      RETURN_IF_ERROR(ort_api.GetTensorElementType(type_shape, &elem_type));
+      RETURN_IF(elem_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, ort_api, "Expected float32 initializers");
+
+      size_t num_dims = 0;
+      RETURN_IF_ERROR(ort_api.GetDimensionsCount(type_shape, &num_dims));
+
+      std::vector<int64_t> dims(num_dims, 0);
+      RETURN_IF_ERROR(ort_api.GetDimensions(type_shape, dims.data(), dims.size()));
+
+      const float* data = nullptr;
+      RETURN_IF_ERROR(ort_api.GetTensorMutableData(const_cast<OrtValue*>(value), (void**)&data));
+
+      FloatInitializer ep_initializer = {std::move(dims), std::vector<float>(data, data + num_elems)};
+      float_initializers_.emplace(name, std::move(ep_initializer));
+    }
+  }
+
+  return nullptr;
+}
+
+/*static*/
+OrtStatus* ORT_API_CALL QnnEp::GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* graph,
+                                                     OrtEpGraphSupportInfo* graph_support_info) {
+  QnnEp* ep = static_cast<QnnEp*>(this_ptr);
+
+  // Get supported nodes using QNN EP pattern
+  std::vector<const OrtNode*> supported_nodes = ep->GetSupportedNodes(graph);
+
+  if (supported_nodes.empty()) {
+    return nullptr;  // No nodes to process
+  }
+
+  // Create (optional) fusion options for the supported nodes to fuse.
+  OrtNodeFusionOptions node_fusion_options = {};
+  node_fusion_options.ort_version_supported = ORT_API_VERSION;
+
+  // Set "drop constant initializers" to true if the compiling EP doesn't need ORT to provide constant initializers
+  // as inputs to the fused/compiled node at inference time. This allows ORT to release unused initializers.
+  // This QNN EP sets this to true and saves initializers during the call to OrtEp::Compile for use
+  // during inference.
+  node_fusion_options.drop_constant_initializers = true;
+  RETURN_IF_ERROR(ep->ep_api.EpGraphSupportInfo_AddNodesToFuse(graph_support_info, supported_nodes.data(),
+                                                               supported_nodes.size(), &node_fusion_options));
+
+  return nullptr;
+}
+
+/*static*/
+OrtStatus* ORT_API_CALL QnnEp::CompileImpl(_In_ OrtEp* this_ptr, _In_ const OrtGraph** graphs,
+                                               _In_ const OrtNode** fused_nodes, _In_ size_t count,
+                                               _Out_writes_all_(count) OrtNodeComputeInfo** node_compute_infos,
+                                               _Out_writes_(count) OrtNode** ep_context_nodes) {
+  QnnEp* ep = static_cast<QnnEp*>(this_ptr);
+  const OrtApi& ort_api = ep->ort_api;
+
+  if (count != 1) {
+    return ort_api.CreateStatus(ORT_EP_FAIL, "Expected to compile a single graph");
+  }
+
+  // In GetCapability(), this EP specified that it doesn't need ORT to provide constant initializers during inference.
+  // So, this EP saves constant initializers so that they're available during inference, but an actual EP
+  // implementation could transfer the weights to device memory.
+  ep->SaveConstantInitializers(graphs[0]);
+
+  OrtArrayOfConstObjects* nodes_array = nullptr;
+  DeferOrtRelease<OrtArrayOfConstObjects> release_nodes(&nodes_array, ort_api.ReleaseArrayOfConstObjects);
+  size_t num_nodes = 0;
+
+  RETURN_IF_ERROR(ort_api.Graph_GetNodes(graphs[0], &nodes_array));
+  RETURN_IF_ERROR(ort_api.ArrayOfConstObjects_GetSize(nodes_array, &num_nodes));
+
+  if (num_nodes != 1) {
+    return ort_api.CreateStatus(ORT_EP_FAIL, "Expected to compile a single Mul node");
+  }
+
+  const OrtNode* node_to_compile = nullptr;
+  RETURN_IF_ERROR(ort_api.ArrayOfConstObjects_GetElementAt(nodes_array, 0,
+                                                           reinterpret_cast<const void**>(&node_to_compile)));
+
+  const char* node_op_type = nullptr;
+  RETURN_IF_ERROR(ort_api.Node_GetOperatorType(node_to_compile, &node_op_type));
+
+  if (std::strncmp(node_op_type, "Mul", 4) != 0) {
+    return ort_api.CreateStatus(ORT_EP_FAIL, "Expected to compile a single Mul node");
+  }
+
+  // Now we know we're compiling a single Mul node. Create a computation kernel.
+  OrtArrayOfConstObjects* inputs = nullptr;
+  DeferOrtRelease<OrtArrayOfConstObjects> release_inputs(&inputs, ort_api.ReleaseArrayOfConstObjects);
+
+  RETURN_IF_ERROR(ort_api.Node_GetInputs(node_to_compile, &inputs));
+  const OrtValueInfo* input0 = nullptr;
+  const OrtValueInfo* input1 = nullptr;
+
+  RETURN_IF_ERROR(ort_api.ArrayOfConstObjects_GetElementAt(inputs, 0, reinterpret_cast<const void**>(&input0)));
+  RETURN_IF_ERROR(ort_api.ArrayOfConstObjects_GetElementAt(inputs, 1, reinterpret_cast<const void**>(&input1)));
+
+  const char* input0_name = nullptr;
+  const char* input1_name = nullptr;
+  RETURN_IF_ERROR(ort_api.GetValueInfoName(input0, &input0_name));
+  RETURN_IF_ERROR(ort_api.GetValueInfoName(input1, &input1_name));
+
+  // Associate the name of the fused node with our QnnMulKernel.
+  const char* fused_node_name = nullptr;
+  RETURN_IF_ERROR(ort_api.Node_GetName(fused_nodes[0], &fused_node_name));
+
+  ep->kernels_.emplace(std::string(fused_node_name), std::make_unique<QnnMulKernel>(ep->ort_api, ep->logger_,
+                                                                                 ep->float_initializers_,
+                                                                                 input0_name, input1_name));
+  // Update the OrtNodeComputeInfo associated with the graph.
+  auto node_compute_info = std::make_unique<QnnNodeComputeInfo>(*ep);
+  node_compute_infos[0] = node_compute_info.release();
+
+  // Create EpContext nodes for the fused nodes we compiled.
+  if (ep->config_.enable_ep_context) {
+    assert(ep_context_nodes != nullptr);
+    RETURN_IF_ERROR(ep->CreateEpContextNodes(gsl::span<const OrtNode*>(fused_nodes, count),
+                                             gsl::span<OrtNode*>(ep_context_nodes, count)));
+  }
+
+  return nullptr;
+}
+
+/*static*/
+void ORT_API_CALL QnnEp::ReleaseNodeComputeInfosImpl(OrtEp* this_ptr,
+                                                         OrtNodeComputeInfo** node_compute_infos,
+                                                         size_t num_node_compute_infos) {
+  (void)this_ptr;
+  for (size_t i = 0; i < num_node_compute_infos; i++) {
+    delete node_compute_infos[i];
+  }
+}
+
+// Creates EPContext nodes from the given fused nodes.
+// This is an example implementation that can be used to generate an EPContext model. However, this QNN EP
+// cannot currently run the EPContext model.
+OrtStatus* QnnEp::CreateEpContextNodes(gsl::span<const OrtNode*> fused_nodes,
+                                           /*out*/ gsl::span<OrtNode*> ep_context_nodes) {
+  assert(fused_nodes.size() == ep_context_nodes.size());
+
+  // Helper to collect input or output names from an array of OrtValueInfo instances.
+  auto collect_input_output_names = [&](const OrtArrayOfConstObjects& value_infos,
+                                        std::vector<const char*>& result) -> OrtStatus* {
+    size_t num_values = 0;
+    RETURN_IF_ERROR(ort_api.ArrayOfConstObjects_GetSize(&value_infos, &num_values));
+
+    std::vector<const char*> value_names(num_values, nullptr);
+
+    for (size_t i = 0; i < num_values; i++) {
+      const void* value_info = nullptr;  // Is a const OrtValueInfo*
+      RETURN_IF_ERROR(ort_api.ArrayOfConstObjects_GetElementAt(&value_infos, i, &value_info));
+      RETURN_IF_ERROR(ort_api.GetValueInfoName(static_cast<const OrtValueInfo*>(value_info), &value_names[i]));
+    }
+
+    result = std::move(value_names);
+    return nullptr;
+  };
+
+  // Create an "EPContext" node for every fused node.
+  for (size_t i = 0; i < fused_nodes.size(); ++i) {
+    const OrtNode* fused_node = fused_nodes[i];
+    const char* fused_node_name = nullptr;
+
+    RETURN_IF_ERROR(ort_api.Node_GetName(fused_node, &fused_node_name));
+
+    OrtArrayOfConstObjects* fused_node_inputs = nullptr;
+    OrtArrayOfConstObjects* fused_node_outputs = nullptr;
+    DeferOrtRelease<OrtArrayOfConstObjects> defer_release0(&fused_node_inputs, ort_api.ReleaseArrayOfConstObjects);
+    DeferOrtRelease<OrtArrayOfConstObjects> defer_release1(&fused_node_outputs, ort_api.ReleaseArrayOfConstObjects);
+
+    RETURN_IF_ERROR(ort_api.Node_GetInputs(fused_node, &fused_node_inputs));
+    RETURN_IF_ERROR(ort_api.Node_GetOutputs(fused_node, &fused_node_outputs));
+
+    std::vector<const char*> input_names;
+    std::vector<const char*> output_names;
+
+    RETURN_IF_ERROR(collect_input_output_names(*fused_node_inputs, /*out*/ input_names));
+    RETURN_IF_ERROR(collect_input_output_names(*fused_node_outputs, /*out*/ output_names));
+
+    int64_t is_main_context = (i == 0);
+    int64_t embed_mode = 1;
+
+    // Create node attributes. The CreateNode() function copies the attributes, so we have to release them.
+    std::array<OrtOpAttr*, 6> attributes = {};
+    DeferOrtRelease<OrtOpAttr> defer_release_attrs(attributes.data(), attributes.size(), ort_api.ReleaseOpAttr);
+
+    RETURN_IF_ERROR(ort_api.CreateOpAttr("ep_cache_context", "binary_data", 1, ORT_OP_ATTR_STRING, &attributes[0]));
+    RETURN_IF_ERROR(ort_api.CreateOpAttr("main_context", &is_main_context, 1, ORT_OP_ATTR_INT, &attributes[1]));
+    RETURN_IF_ERROR(ort_api.CreateOpAttr("embed_mode", &embed_mode, 1, ORT_OP_ATTR_INT, &attributes[2]));
+    RETURN_IF_ERROR(ort_api.CreateOpAttr("ep_sdk_version", "1", 1, ORT_OP_ATTR_STRING, &attributes[3]));
+    RETURN_IF_ERROR(ort_api.CreateOpAttr("partition_name", fused_node_name, 1, ORT_OP_ATTR_STRING, &attributes[4]));
+    RETURN_IF_ERROR(ort_api.CreateOpAttr("source", this->name_.c_str(), 1, ORT_OP_ATTR_STRING, &attributes[5]));
+
+    RETURN_IF_ERROR(model_editor_api.CreateNode("EPContext", "com.microsoft", fused_node_name,
+                                                input_names.data(), input_names.size(),
+                                                output_names.data(), output_names.size(),
+                                                attributes.data(), attributes.size(),
+                                                &ep_context_nodes[i]));
+  }
+
+  return nullptr;
+}
+//
+// Implementation of QnnNodeComputeInfo
+//
+QnnNodeComputeInfo::QnnNodeComputeInfo(QnnEp& ep) : ep(ep) {
+  ort_version_supported = ORT_API_VERSION;
+  CreateState = CreateStateImpl;
+  Compute = ComputeImpl;
+  ReleaseState = ReleaseStateImpl;
+}
+
+OrtStatus* QnnNodeComputeInfo::CreateStateImpl(OrtNodeComputeInfo* this_ptr,
+                                                   OrtNodeComputeContext* compute_context,
+                                                   void** compute_state) {
+  auto* node_compute_info = static_cast<QnnNodeComputeInfo*>(this_ptr);
+  QnnEp& ep = node_compute_info->ep;
+
+  std::string fused_node_name = ep.ep_api.NodeComputeContext_NodeName(compute_context);
+  auto kernel_it = ep.Kernels().find(fused_node_name);
+  if (kernel_it == ep.Kernels().end()) {
+    std::string message = "Unable to get kernel for fused node with name " + fused_node_name;
+    return ep.ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+  }
+
+  QnnMulKernel& kernel = *kernel_it->second;
+  *compute_state = &kernel;
+  return nullptr;
+}
+
+OrtStatus* QnnNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_ptr, void* compute_state,
+                                               OrtKernelContext* kernel_context) {
+  (void)this_ptr;
+  QnnMulKernel& kernel = *reinterpret_cast<QnnMulKernel*>(compute_state);
+  return kernel.Compute(kernel_context);
+}
+
+void QnnNodeComputeInfo::ReleaseStateImpl(OrtNodeComputeInfo* this_ptr, void* compute_state) {
+  (void)this_ptr;
+  QnnMulKernel& kernel = *reinterpret_cast<QnnMulKernel*>(compute_state);
+  (void)kernel;
+  // Do nothing for this QNN example.
+}
+
+// GetSupportedNodes implementation following QNN EP pattern
+std::vector<const OrtNode*> QnnEp::GetSupportedNodes(const OrtGraph* graph) const {
+  std::vector<const OrtNode*> supported_nodes;
+
+  OrtArrayOfConstObjects* nodes_array = nullptr;
+  DeferOrtRelease<OrtArrayOfConstObjects> release_nodes_array(&nodes_array, ort_api.ReleaseArrayOfConstObjects);
+
+  size_t num_nodes = 0;
+
+  if (ort_api.Graph_GetNodes(graph, &nodes_array) != nullptr) {
+    return supported_nodes;  // Return empty on error
+  }
+
+  if (ort_api.ArrayOfConstObjects_GetSize(nodes_array, &num_nodes) != nullptr) {
+    return supported_nodes;  // Return empty on error
+  }
+
+  if (num_nodes == 0) {
+    return supported_nodes;  // No nodes to process
+  }
+
+  const void* const* nodes_data = nullptr;
+  if (ort_api.ArrayOfConstObjects_GetData(nodes_array, &nodes_data) != nullptr) {
+    return supported_nodes;  // Return empty on error
+  }
+
+  auto nodes_span = gsl::span<const OrtNode* const>(reinterpret_cast<const OrtNode* const*>(nodes_data), num_nodes);
+
+  // Use op builder system to determine supported nodes (following QNN provider pattern)
+  for (const OrtNode* node : nodes_span) {
+    const char* op_type = nullptr;
+    if (ort_api.Node_GetOperatorType(node, &op_type) != nullptr) {
+      continue;  // Skip on error
+    }
+
+    // Get op builder for this op type
+    const qnn_ep::IOpBuilder* op_builder = qnn_ep::GetOpBuilder(op_type);
+    if (op_builder != nullptr) {
+      // Check if this specific node is supported
+      ApiPtrs apis = {ort_api, ep_api, model_editor_api};
+      OrtStatus* status = op_builder->IsOpSupported(apis, node);
+      if (status == nullptr) {
+        // Node is supported, add to list
+        supported_nodes.push_back(node);
+      } else {
+        // Node not supported, release status and continue
+        ort_api.ReleaseStatus(status);
+      }
+    }
+    // If no op builder found, node is not supported (skip silently)
+  }
+
+  return supported_nodes;
+}
+
+// CreatePreferredAllocators implementation following QNN EP pattern
+// Note: Commented out until AllocatorPtr definition is available
+/*
+std::vector<AllocatorPtr> QnnEp::CreatePreferredAllocators() {
+  std::vector<AllocatorPtr> allocators{};
+
+  if (IsHtpSharedMemoryAllocatorAvailable()) {
+    try {
+      // Create HTP shared memory allocator following QNN provider pattern
+      auto htp_allocator = std::make_unique<qnn::HtpSharedMemoryAllocator>(rpcmem_library_, &logger_);
+      
+      // Convert to AllocatorPtr (this conversion needs adjustment based on actual AllocatorPtr definition)
+      AllocatorPtr allocator_ptr(std::move(htp_allocator));
+      allocators.emplace_back(std::move(allocator_ptr));
+      
+      auto status = ort_api.Logger_LogMessage(&logger_,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+                                              "QnnEp: Created HTP shared memory allocator",
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+      (void)status;  // ignore status for now
+    } catch (const std::exception& e) {
+      auto status = ort_api.Logger_LogMessage(&logger_,
+                                              OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                              ("QnnEp: Failed to create HTP shared memory allocator: " + std::string(e.what())).c_str(),
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+      (void)status;  // ignore status for now
+    }
+  }
+  
+  return allocators;
+}
+*/

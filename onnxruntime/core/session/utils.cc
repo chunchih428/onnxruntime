@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <utility>
+#include <iostream>
 
 #include "core/framework/error_code_helper.h"
 #include "core/framework/execution_provider.h"
@@ -214,20 +215,25 @@ OrtStatus* InitializeSession(_In_ const OrtSessionOptions* options,
               "Session logger is invalid, but should have been initialized during session construction.");
 
   const bool has_provider_factories = options != nullptr && !options->provider_factories.empty();
-
+  std::cout << "has_provider_factories: " << has_provider_factories << std::endl;
   if (has_provider_factories) {
     std::vector<std::unique_ptr<IExecutionProvider>> provider_list;
     for (auto& factory : options->provider_factories) {
+      std::cout << "Creating provider from factory: " << std::endl;
       auto provider = factory->CreateProvider(*options, *session_logger->ToExternal());
       provider_list.push_back(std::move(provider));
     }
 
+    std::cout << "Number of providers created from factories: " << provider_list.size() << std::endl;
     // register the providers
     for (auto& provider : provider_list) {
       if (provider) {
+        std::cout << "Before RegisterExecutionProvider, provider: " << std::endl;
         ORT_API_RETURN_IF_STATUS_NOT_OK(sess.RegisterExecutionProvider(std::move(provider)));
+        std::cout << "After RegisterExecutionProvider, provider: " << std::endl;
       }
     }
+    std::cout << "Registered " << provider_list.size() << " providers." << std::endl;
   }
 #if !defined(ORT_MINIMAL_BUILD)
   else {
@@ -250,8 +256,10 @@ OrtStatus* InitializeSession(_In_ const OrtSessionOptions* options,
     ORT_API_RETURN_IF_STATUS_NOT_OK(sess.AddPrePackedWeightsContainer(
         reinterpret_cast<PrepackedWeightsContainer*>(prepacked_weights_container)));
   }
+  std::cout << "Before InitializeSession, session " << std::endl;
 
   ORT_API_RETURN_IF_STATUS_NOT_OK(sess.Initialize());
+  std::cout << "After InitializeSession, session " << std::endl;
 
   return nullptr;
 }
@@ -299,6 +307,7 @@ Status LoadPluginOrProviderBridge(const std::string& registration_name,
                                                             true,
                                                             ProviderLibraryPathType::Absolute);
   bool is_provider_bridge = provider_library->Load() == Status::OK();  // library has GetProvider
+  std::cout << "is_provider_bridge: " << std::boolalpha << is_provider_bridge << std::endl;
   LOGS_DEFAULT(INFO) << "Loading EP library: " << library_path
                      << (is_provider_bridge ? " as a provider bridge" : " as a plugin");
 

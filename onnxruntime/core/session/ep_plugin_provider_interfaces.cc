@@ -45,7 +45,8 @@ PluginExecutionProviderFactory::PluginExecutionProviderFactory(OrtEpFactory& ep_
 std::unique_ptr<IExecutionProvider>
 PluginExecutionProviderFactory::CreateProvider(const OrtSessionOptions& session_options,
                                                const OrtLogger& session_logger) {
-  OrtEp* ort_ep = nullptr;
+  std::cout << "DEBUG: PluginExecutionProviderFactory::CreateProvider called." << std::endl;
+                                                OrtEp* ort_ep = nullptr;
   Status status = ToStatusAndRelease(ep_factory_.CreateEp(&ep_factory_, hardware_devices_.data(), ep_metadata_.data(),
                                                           hardware_devices_.size(), &session_options, &session_logger,
                                                           &ort_ep));
@@ -461,7 +462,10 @@ Status PluginExecutionProvider::SetEpDynamicOptions(gsl::span<const char* const>
 }
 std::unique_ptr<onnxruntime::IDataTransfer> PluginExecutionProvider::GetDataTransfer() const {
   OrtDataTransferImpl* data_transfer_impl = nullptr;
+  std::cout << "DEBUG: PluginExecutionProvider::GetDataTransfer called." << std::endl;
+  return {};
   OrtStatus* status = ep_factory_.CreateDataTransfer(&ep_factory_, &data_transfer_impl);
+  std::cout << "DEBUG: PluginExecutionProvider::GetDataTransfer after CreateDataTransfer." << std::endl;
   if (status != nullptr) {
     ORT_THROW("Error creating data transfer: ", ToStatusAndRelease(status).ToString());
   }
@@ -469,7 +473,7 @@ std::unique_ptr<onnxruntime::IDataTransfer> PluginExecutionProvider::GetDataTran
   if (data_transfer_impl == nullptr) {
     return {};
   }
-
+  std::cout << "DEBUG: PluginExecutionProvider::GetDataTransfer returning DataTransfer." << std::endl;
   return std::make_unique<plugin_ep::DataTransfer>(*data_transfer_impl);
 }
 

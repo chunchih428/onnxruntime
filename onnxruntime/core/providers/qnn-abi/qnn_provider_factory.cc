@@ -3,9 +3,19 @@
 
 #include <string>
 #include <unordered_map>
-#include "core/providers/qnn/qnn_provider_factory_creator.h"
-#include "core/providers/qnn/qnn_execution_provider.h"
-#include "core/providers/qnn/builder/qnn_utils.h"
+#include "core/providers/qnn-abi/qnn_provider_factory_creator.h"
+#include "core/providers/qnn-abi/qnn_execution_provider.h"
+#include "core/providers/qnn-abi/builder/qnn_utils.h"
+#include <iostream>
+#include "core/session/onnxruntime_c_api.h"
+#include "core/session/abi_devices.h"
+
+#if !BUILD_QNN_EP_STATIC_LIB
+#include "core/providers/qnn-abi/qnn_ep_factory.h"
+// #include "core/providers/qnn-abi/qnn_plugin_wrapper.h"
+#include <gsl/gsl>
+#endif
+
 
 namespace onnxruntime {
 struct QNNProviderFactory : IExecutionProviderFactory {
@@ -79,8 +89,8 @@ struct QNN_Provider : Provider {
     return std::make_shared<onnxruntime::QNNProviderFactory>(*provider_options, config_options);
   }
 
-  Status CreateIExecutionProvider(const OrtHardwareDevice* const* /*devices*/,
-                                  const OrtKeyValuePairs* const* /*ep_metadata*/,
+  Status CreateIExecutionProvider(const OrtHardwareDevice* const* devices,
+                                  const OrtKeyValuePairs* const* ep_metadata,
                                   size_t num_devices,
                                   ProviderOptions& provider_options,
                                   const OrtSessionOptions& session_options,
@@ -89,13 +99,27 @@ struct QNN_Provider : Provider {
     if (num_devices != 1) {
       return Status(common::ONNXRUNTIME, ORT_EP_FAIL, "QNN EP only supports one device.");
     }
+    #if BUILD_QNN_EP_STATIC_LIB
+      // Static library build - use built-in QNN EP creation
+      const ConfigOptions* config_options = &session_options.GetConfigOptions();
 
-    const ConfigOptions* config_options = &session_options.GetConfigOptions();
+      std::array<const void*, 2> configs_array = {&provider_options, config_options};
+      const void* arg = reinterpret_cast<const void*>(&configs_array);
+      auto ep_factory = CreateExecutionProviderFactory(arg);
+      std::cout << "DEBUG: Creating IExecutionProvider for QNN EP static (1111)" << std::endl;
+      ep = ep_factory->CreateProvider(session_options, logger);
+    #else
+      provider_options;
+      ep_metadata;
+      devices;
+      const ConfigOptions* config_options = &session_options.GetConfigOptions();
 
-    std::array<const void*, 2> configs_array = {&provider_options, config_options};
-    const void* arg = reinterpret_cast<const void*>(&configs_array);
-    auto ep_factory = CreateExecutionProviderFactory(arg);
-    ep = ep_factory->CreateProvider(session_options, logger);
+      std::array<const void*, 2> configs_array = {&provider_options, config_options};
+      const void* arg = reinterpret_cast<const void*>(&configs_array);
+      auto ep_factory = CreateExecutionProviderFactory(arg);
+
+      ep = ep_factory->CreateProvider(session_options, logger);
+    #endif
 
     return Status::OK();
   }
@@ -104,7 +128,6 @@ struct QNN_Provider : Provider {
   void Shutdown() override {}
 } g_provider;
 #endif  // BUILD_QNN_EP_STATIC_LIB
-
 }  // namespace onnxruntime
 
 #if !BUILD_QNN_EP_STATIC_LIB

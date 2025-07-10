@@ -8,10 +8,9 @@
 #include <cassert>
 
 // #include "qnn_ep.h"
-#include "test/autoep/library/ep_data_transfer.h"
-#include "test/autoep/library/example_plugin_ep_utils.h"
-#include "test/autoep/library/ep_allocator.h"
-#include "core/framework/error_code_helper.h"
+// #include "test/autoep/library/ep_data_transfer.h"
+// #include "test/autoep/library/example_plugin_ep_utils.h"
+// #include "test/autoep/library/ep_allocator.h"
 #include <iostream>
 
 // Global registry to store the QNN EP factory for auto EP selection

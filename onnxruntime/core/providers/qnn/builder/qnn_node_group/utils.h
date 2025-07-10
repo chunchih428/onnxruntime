@@ -8,7 +8,7 @@
 #include <unordered_map>
 
 #include "core/providers/qnn/builder/qnn_node_group/qnn_node_group.h"
-#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/ort_api2.h"
 
 namespace onnxruntime {
 namespace qnn {

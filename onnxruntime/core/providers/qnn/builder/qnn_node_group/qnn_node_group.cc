@@ -19,7 +19,7 @@
 #include "core/providers/qnn/builder/qnn_node_group/channel_shuffle_fusion.h"
 
 #include "core/providers/qnn/builder/qnn_utils.h"
-#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/ort_api2.h"
 
 namespace onnxruntime {
 namespace qnn {

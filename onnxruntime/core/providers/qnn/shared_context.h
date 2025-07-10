@@ -5,7 +5,7 @@
 #include <mutex>
 #include <vector>
 
-#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/ort_api2.h"
 #if !BUILD_QNN_EP_STATIC_LIB
 #include "core/providers/qnn-abi/builder/qnn_model.h"
 #else

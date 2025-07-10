@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/ort_api2.h"
 
 #if !BUILD_QNN_EP_STATIC_LIB
 TRACELOGGING_DECLARE_PROVIDER(telemetry_provider_handle);

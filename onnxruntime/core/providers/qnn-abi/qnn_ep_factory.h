@@ -3,12 +3,9 @@
 
 #pragma once
 
-#include "core/session/onnxruntime_c_api.h"
-// #include "qnn_ep.h"
-#include "test/autoep/library/ep_data_transfer.h"
+// #include "test/autoep/library/ep_data_transfer.h"
 #include "test/autoep/library/example_plugin_ep_utils.h"
 
-#if !BUILD_QNN_EP_STATIC_LIB
 #include "core/framework/error_code_helper.h"
 #include "qnn_ep.h"
 
@@ -52,5 +49,3 @@ struct QnnEpFactory : public OrtEpFactory, public ApiPtrs {
 };
 
 }  // namespace onnxruntime
-
-#endif  // !BUILD_QNN_EP_STATIC_LIB

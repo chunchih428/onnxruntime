@@ -7,7 +7,7 @@
 #include <fstream>
 #include <filesystem>
 
-#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/ort_api2.h"
 #include "core/providers/qnn/builder/qnn_utils.h"
 #include "core/providers/qnn/builder/qnn_model.h"
 #include "core/providers/qnn/shared_context.h"

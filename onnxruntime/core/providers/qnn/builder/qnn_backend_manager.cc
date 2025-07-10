@@ -21,7 +21,7 @@
 #include "Saver/QnnSaverCommon.h"
 #include <gsl/gsl>
 
-#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/ort_api2.h"
 #include "core/providers/qnn/qnn_allocator.h"
 #include "core/providers/qnn/qnn_telemetry.h"
 #include "core/providers/qnn/shared_context.h"

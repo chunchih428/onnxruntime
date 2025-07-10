@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "core/providers/qnn/builder/qnn_def.h"
-#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/ort_api2.h"
 
 namespace onnxruntime {
 

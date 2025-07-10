@@ -11,7 +11,7 @@
 #include "core/providers/qnn/builder/op_builder_factory.h"
 #include "core/providers/qnn/builder/qnn_node_group/qnn_node_group.h"
 #include "core/providers/qnn/builder/qnn_utils.h"
-#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/ort_api2.h"
 #include "core/providers/qnn/qnn_allocator.h"
 #include "core/providers/qnn/shared_context.h"
 

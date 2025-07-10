@@ -54,7 +54,7 @@ TRACELOGGING_DEFINE_PROVIDER(telemetry_provider_handle, "Microsoft.ML.ONNXRuntim
 #endif
 #endif  // !BUILD_QNN_EP_STATIC_LIB
 
-#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/ort_api2.h"
 
 namespace onnxruntime {
 namespace qnn {

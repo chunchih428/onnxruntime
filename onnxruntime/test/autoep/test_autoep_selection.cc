@@ -5,6 +5,7 @@
 #ifdef _WIN32
 
 #include <filesystem>
+#include <unordered_map>
 #include <absl/base/config.h>
 #include <gtest/gtest.h>
 
@@ -14,6 +15,8 @@
 #include "core/session/abi_key_value_pairs.h"
 #include "core/session/abi_session_options_impl.h"
 #include "core/session/onnxruntime_cxx_api.h"
+#include "core/session/inference_session.h"
+#include "core/session/onnxruntime_session_options_config_keys.h"
 
 #include "test_allocator.h"
 #include "test/shared_lib/utils.h"
@@ -653,6 +656,43 @@ TEST(OrtEpLibrary, PluginEp_PreferCpu_MulInference) {
     // PREFER_CPU pick our example EP over ORT CPU EP. TODO: Actually assert this.
     Ort::SessionOptions session_options;
     session_options.SetEpSelectionPolicy(OrtExecutionProviderDevicePolicy_PREFER_CPU);
+    RunModelWithPluginEp(session_options);
+  }
+
+  ort_env->UnregisterExecutionProviderLibrary(registration_name.c_str());
+}
+
+// Test that verifies QNN-ABI shared library build code path execution (line 91 in qnn_ep.cc)
+// This test should execute the "555555555555555555555" debug output
+TEST(OrtEpLibrary, QnnAbiEp_SharedLibraryCodePathExecution) {
+  const std::filesystem::path& library_path =
+#if _WIN32
+      "./onnxruntime_providers_qnn.dll";
+#else
+      "./libonnxruntime_providers_qnn.so";
+#endif
+  const std::string& registration_name = "QnnAbiTestProvider";
+
+  ort_env->RegisterExecutionProviderLibrary(registration_name.c_str(), library_path.c_str());
+
+  {
+    std::vector<Ort::ConstEpDevice> ep_devices = ort_env->GetEpDevices();
+
+    // Find the OrtEpDevice associated with our example plugin EP.
+    Ort::ConstEpDevice plugin_ep_device;
+    for (Ort::ConstEpDevice& device : ep_devices) {
+      if (std::string(device.EpName()) == registration_name) {
+        plugin_ep_device = device;
+        break;
+      }
+    }
+    ASSERT_NE(plugin_ep_device, nullptr);
+    std::cout << "Found plugin EP: " << plugin_ep_device.EpName() << std::endl;
+    // Create session with example plugin EP
+    Ort::SessionOptions session_options;
+    std::unordered_map<std::string, std::string> ep_options;
+    session_options.AppendExecutionProvider_V2(*ort_env, std::vector<Ort::ConstEpDevice>{plugin_ep_device}, ep_options);
+
     RunModelWithPluginEp(session_options);
   }
 

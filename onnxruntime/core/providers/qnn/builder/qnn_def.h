@@ -9,7 +9,7 @@
 #include <memory>
 #include <climits>
 #include <type_traits>
-#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/ort_api2.h"
 #include "core/providers/qnn/builder/qnn_quant_params_wrapper.h"
 
 namespace onnxruntime {
